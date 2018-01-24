@@ -1,0 +1,1150 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+'''Utilities for spectral processing'''
+
+import numpy as np
+import scipy.fftpack as fft
+import scipy
+import scipy.signal
+import scipy.interpolate
+import six
+
+from . import time_frequency
+from .. import cache
+from .. import util
+from ..util.decorators import moved
+from ..util.deprecation import rename_kw, Deprecated
+from ..util.exceptions import ParameterError
+from ..filters import get_window
+
+__all__ = ['stft', 'istft', 'magphase',
+           'ifgram', 'phase_vocoder',
+           'logamplitude', 'perceptual_weighting',
+           'power_to_db', 'db_to_power',
+           'amplitude_to_db', 'db_to_amplitude',
+           'fmt']
+
+
+@cache(level=20)
+def stft(y, n_fft=2048, hop_length=None, win_length=None, window='hann',
+         center=True, dtype=np.complex64):
+    """Short-time Fourier transform (STFT)
+
+    Returns a complex-valued matrix D such that
+        `np.abs(D[f, t])` is the magnitude of frequency bin `f`
+        at frame `t`
+
+        `np.angle(D[f, t])` is the phase of frequency bin `f`
+        at frame `t`
+
+    Parameters
+    ----------
+    y : np.ndarray [shape=(n,)], real-valued
+        the input signal (audio time series)
+
+    n_fft : int > 0 [scalar]
+        FFT window size
+
+    hop_length : int > 0 [scalar]
+        number audio of frames between STFT columns.
+        If unspecified, defaults `win_length / 4`.
+
+    win_length  : int <= n_fft [scalar]
+        Each frame of audio is windowed by `window()`.
+        The window will be of length `win_length` and then padded
+        with zeros to match `n_fft`.
+
+        If unspecified, defaults to ``win_length = n_fft``.
+
+    window : string, tuple, number, function, or np.ndarray [shape=(n_fft,)]
+        - a window specification (string, tuple, or number);
+          see `scipy.signal.get_window`
+        - a window function, such as `scipy.signal.hanning`
+        - a vector or array of length `n_fft`
+
+        .. see also:: `filters.get_window`
+
+    center      : boolean
+        - If `True`, the signal `y` is padded so that frame
+          `D[:, t]` is centered at `y[t * hop_length]`.
+        - If `False`, then `D[:, t]` begins at `y[t * hop_length]`
+
+    dtype       : numeric type
+        Complex numeric type for `D`.  Default is 64-bit complex.
+
+
+    Returns
+    -------
+    D : np.ndarray [shape=(1 + n_fft/2, t), dtype=dtype]
+        STFT matrix
+
+
+    See Also
+    --------
+    istft : Inverse STFT
+
+    ifgram : Instantaneous frequency spectrogram
+
+
+    Notes
+    -----
+    This function caches at level 20.
+
+
+    Examples
+    --------
+
+    >>> y, sr = librosa.load(librosa.util.example_audio_file())
+    >>> D = librosa.stft(y)
+    >>> D
+    array([[  2.576e-03 -0.000e+00j,   4.327e-02 -0.000e+00j, ...,
+              3.189e-04 -0.000e+00j,  -5.961e-06 -0.000e+00j],
+           [  2.441e-03 +2.884e-19j,   5.145e-02 -5.076e-03j, ...,
+             -3.885e-04 -7.253e-05j,   7.334e-05 +3.868e-04j],
+          ...,
+           [ -7.120e-06 -1.029e-19j,  -1.951e-09 -3.568e-06j, ...,
+             -4.912e-07 -1.487e-07j,   4.438e-06 -1.448e-05j],
+           [  7.136e-06 -0.000e+00j,   3.561e-06 -0.000e+00j, ...,
+             -5.144e-07 -0.000e+00j,  -1.514e-05 -0.000e+00j]], dtype=complex64)
+
+
+    Use left-aligned frames, instead of centered frames
+
+
+    >>> D_left = librosa.stft(y, center=False)
+
+
+    Use a shorter hop length
+
+
+    >>> D_short = librosa.stft(y, hop_length=64)
+
+
+    Display a spectrogram
+
+
+    >>> import matplotlib.pyplot as plt
+    >>> librosa.display.specshow(librosa.amplitude_to_db(D,
+    ...                                                  ref=np.max),
+    ...                          y_axis='log', x_axis='time')
+    >>> plt.title('Power spectrogram')
+    >>> plt.colorbar(format='%+2.0f dB')
+    >>> plt.tight_layout()
+
+    """
+
+    # By default, use the entire frame
+    if win_length is None:
+        win_length = n_fft
+
+    # Set the default hop, if it's not already specified
+    if hop_length is None:
+        hop_length = int(win_length // 4)
+
+    fft_window = get_window(window, win_length, fftbins=True)
+
+    # Pad the window out to n_fft size
+    fft_window = util.pad_center(fft_window, n_fft)
+
+    # Reshape so that the window can be broadcast
+    fft_window = fft_window.reshape((-1, 1))
+
+    # Pad the time series so that frames are centered
+    if center:
+        util.valid_audio(y)
+        y = np.pad(y, int(n_fft // 2), mode='reflect')
+
+    # Window the time series.
+    y_frames = util.frame(y, frame_length=n_fft, hop_length=hop_length)
+
+    # Pre-allocate the STFT matrix
+    stft_matrix = np.empty((int(1 + n_fft // 2), y_frames.shape[1]),
+                           dtype=dtype,
+                           order='F')
+
+    # how many columns can we fit within MAX_MEM_BLOCK?
+    n_columns = int(util.MAX_MEM_BLOCK / (stft_matrix.shape[0] *
+                                          stft_matrix.itemsize))
+
+    for bl_s in range(0, stft_matrix.shape[1], n_columns):
+        bl_t = min(bl_s + n_columns, stft_matrix.shape[1])
+
+        # RFFT and Conjugate here to match phase from DPWE code
+        stft_matrix[:, bl_s:bl_t] = fft.fft(fft_window *
+                                            y_frames[:, bl_s:bl_t],
+                                            axis=0)[:stft_matrix.shape[0]].conj()
+
+    return stft_matrix
+
+
+@cache(level=30)
+def istft(stft_matrix, hop_length=None, win_length=None, window='hann',
+          center=True, dtype=np.float32):
+    """
+    Inverse short-time Fourier transform (ISTFT).
+
+    Converts a complex-valued spectrogram `stft_matrix` to time-series `y`
+    by minimizing the mean squared error between `stft_matrix` and STFT of
+    `y` as described in [1]_.
+
+    In general, window function, hop length and other parameters should be same
+    as in stft, which mostly leads to perfect reconstruction of a signal from
+    unmodified `stft_matrix`.
+
+    .. [1] D. W. Griffin and J. S. Lim,
+        "Signal estimation from modified short-time Fourier transform,"
+        IEEE Trans. ASSP, vol.32, no.2, pp.236–243, Apr. 1984.
+
+    Parameters
+    ----------
+    stft_matrix : np.ndarray [shape=(1 + n_fft/2, t)]
+        STFT matrix from `stft`
+
+    hop_length  : int > 0 [scalar]
+        Number of frames between STFT columns.
+        If unspecified, defaults to `win_length / 4`.
+
+    win_length  : int <= n_fft = 2 * (stft_matrix.shape[0] - 1)
+        When reconstructing the time series, each frame is windowed
+        and each sample is normalized by the sum of squared window
+        according to the `window` function (see below).
+
+        If unspecified, defaults to `n_fft`.
+
+    window      : string, tuple, number, function, np.ndarray [shape=(n_fft,)]
+        - a window specification (string, tuple, or number);
+          see `scipy.signal.get_window`
+        - a window function, such as `scipy.signal.hanning`
+        - a user-specified window vector of length `n_fft`
+
+        .. see also:: `filters.get_window`
+
+    center      : boolean
+        - If `True`, `D` is assumed to have centered frames.
+        - If `False`, `D` is assumed to have left-aligned frames.
+
+    dtype       : numeric type
+        Real numeric type for `y`.  Default is 32-bit float.
+
+    Returns
+    -------
+    y : np.ndarray [shape=(n,)]
+        time domain signal reconstructed from `stft_matrix`
+
+    See Also
+    --------
+    stft : Short-time Fourier Transform
+
+    Notes
+    -----
+    This function caches at level 30.
+
+    Examples
+    --------
+    >>> y, sr = librosa.load(librosa.util.example_audio_file())
+    >>> D = librosa.stft(y)
+    >>> y_hat = librosa.istft(D)
+    >>> y_hat
+    array([ -4.812e-06,  -4.267e-06, ...,   6.271e-06,   2.827e-07], dtype=float32)
+
+    Exactly preserving length of the input signal requires explicit padding.
+    Otherwise, a partial frame at the end of `y` will not be represented.
+
+    >>> n = len(y)
+    >>> n_fft = 2048
+    >>> y_pad = librosa.util.fix_length(y, n + n_fft // 2)
+    >>> D = librosa.stft(y_pad, n_fft=n_fft)
+    >>> y_out = librosa.util.fix_length(librosa.istft(D), n)
+    >>> np.max(np.abs(y - y_out))
+    1.4901161e-07
+    """
+
+    n_fft = 2 * (stft_matrix.shape[0] - 1)
+
+    # By default, use the entire frame
+    if win_length is None:
+        win_length = n_fft
+
+    # Set the default hop, if it's not already specified
+    if hop_length is None:
+        hop_length = int(win_length // 4)
+
+    ifft_window = get_window(window, win_length, fftbins=True)
+
+    # Pad out to match n_fft
+    ifft_window = util.pad_center(ifft_window, n_fft)
+
+    n_frames = stft_matrix.shape[1]
+    expected_signal_len = n_fft + hop_length * (n_frames - 1)
+    y = np.zeros(expected_signal_len, dtype=dtype)
+    ifft_window_sum = np.zeros(expected_signal_len, dtype=dtype)
+    ifft_window_square = ifft_window * ifft_window
+
+    for i in range(n_frames):
+        sample = i * hop_length
+        spec = stft_matrix[:, i].flatten()
+        spec = np.concatenate((spec.conj(), spec[-2:0:-1]), 0)
+        ytmp = ifft_window * fft.ifft(spec).real
+
+        y[sample:(sample + n_fft)] = y[sample:(sample + n_fft)] + ytmp
+        ifft_window_sum[sample:(sample + n_fft)] += ifft_window_square
+
+    # Normalize by sum of squared window
+    approx_nonzero_indices = ifft_window_sum > util.tiny(ifft_window_sum)
+    y[approx_nonzero_indices] /= ifft_window_sum[approx_nonzero_indices]
+
+    if center:
+        y = y[int(n_fft // 2):-int(n_fft // 2)]
+
+    return y
+
+
+def ifgram(y, sr=22050, n_fft=2048, hop_length=None, win_length=None,
+           window='hann', norm=False, center=True, ref_power=1e-6,
+           clip=True, dtype=np.complex64):
+    '''Compute the instantaneous frequency (as a proportion of the sampling rate)
+    obtained as the time-derivative of the phase of the complex spectrum as
+    described by [1]_.
+
+    Calculates regular STFT as a side effect.
+
+    .. [1] Abe, Toshihiko, Takao Kobayashi, and Satoshi Imai.
+        "Harmonics tracking and pitch extraction based on instantaneous
+        frequency."
+        International Conference on Acoustics, Speech, and Signal Processing,
+        ICASSP-95., Vol. 1. IEEE, 1995.
+
+    Parameters
+    ----------
+    y : np.ndarray [shape=(n,)]
+        audio time series
+
+    sr : number > 0 [scalar]
+        sampling rate of `y`
+
+    n_fft : int > 0 [scalar]
+        FFT window size
+
+    hop_length : int > 0 [scalar]
+        hop length, number samples between subsequent frames.
+        If not supplied, defaults to `win_length / 4`.
+
+    win_length : int > 0, <= n_fft
+        Window length. Defaults to `n_fft`.
+        See `stft` for details.
+
+    window : string, tuple, number, function, or np.ndarray [shape=(n_fft,)]
+        - a window specification (string, tuple, number);
+          see `scipy.signal.get_window`
+        - a window function, such as `scipy.signal.hanning`
+        - a user-specified window vector of length `n_fft`
+
+        See `stft` for details.
+
+        .. see also:: `filters.get_window`
+
+    norm : bool
+        Normalize the STFT.
+
+    center      : boolean
+        - If `True`, the signal `y` is padded so that frame
+            `D[:, t]` (and `if_gram`) is centered at `y[t * hop_length]`.
+        - If `False`, then `D[:, t]` at `y[t * hop_length]`
+
+    ref_power : float >= 0 or callable
+        Minimum power threshold for estimating instantaneous frequency.
+        Any bin with `np.abs(D[f, t])**2 < ref_power` will receive the
+        default frequency estimate.
+
+        If callable, the threshold is set to `ref_power(np.abs(D)**2)`.
+
+    clip : boolean
+        - If `True`, clip estimated frequencies to the range `[0, 0.5 * sr]`.
+        - If `False`, estimated frequencies can be negative or exceed
+          `0.5 * sr`.
+
+    dtype : numeric type
+        Complex numeric type for `D`.  Default is 64-bit complex.
+
+    Returns
+    -------
+    if_gram : np.ndarray [shape=(1 + n_fft/2, t), dtype=real]
+        Instantaneous frequency spectrogram:
+        `if_gram[f, t]` is the frequency at bin `f`, time `t`
+
+    D : np.ndarray [shape=(1 + n_fft/2, t), dtype=complex]
+        Short-time Fourier transform
+
+    See Also
+    --------
+    stft : Short-time Fourier Transform
+
+    Examples
+    --------
+    >>> y, sr = librosa.load(librosa.util.example_audio_file())
+    >>> frequencies, D = librosa.ifgram(y, sr=sr)
+    >>> frequencies
+    array([[  0.000e+00,   0.000e+00, ...,   0.000e+00,   0.000e+00],
+           [  3.150e+01,   3.070e+01, ...,   1.077e+01,   1.077e+01],
+           ...,
+           [  1.101e+04,   1.101e+04, ...,   1.101e+04,   1.101e+04],
+           [  1.102e+04,   1.102e+04, ...,   1.102e+04,   1.102e+04]])
+
+    '''
+
+    if win_length is None:
+        win_length = n_fft
+
+    if hop_length is None:
+        hop_length = int(win_length // 4)
+
+    # Construct a padded hann window
+    fft_window = util.pad_center(get_window(window, win_length,
+                                            fftbins=True),
+                                 n_fft)
+
+    # Window for discrete differentiation
+    freq_angular = np.linspace(0, 2 * np.pi, n_fft, endpoint=False)
+
+    d_window = np.sin(-freq_angular) * np.pi / n_fft
+
+    stft_matrix = stft(y, n_fft=n_fft, hop_length=hop_length,
+                       win_length=win_length,
+                       window=window, center=center, dtype=dtype)
+
+    diff_stft = stft(y, n_fft=n_fft, hop_length=hop_length,
+                     window=d_window, center=center, dtype=dtype).conj()
+
+    # Compute power normalization. Suppress zeros.
+    mag, phase = magphase(stft_matrix)
+
+    if six.callable(ref_power):
+        ref_power = ref_power(mag**2)
+    elif ref_power < 0:
+        raise ParameterError('ref_power must be non-negative or callable.')
+
+    # Pylint does not correctly infer the type here, but it's correct.
+    # pylint: disable=maybe-no-member
+    freq_angular = freq_angular.reshape((-1, 1))
+    bin_offset = (phase * diff_stft).imag / mag
+
+    bin_offset[mag < ref_power**0.5] = 0
+
+    if_gram = freq_angular[:n_fft//2 + 1] + bin_offset
+
+    if norm:
+        stft_matrix = stft_matrix * 2.0 / fft_window.sum()
+
+    if clip:
+        np.clip(if_gram, 0, np.pi, out=if_gram)
+
+    if_gram *= float(sr) * 0.5 / np.pi
+
+    return if_gram, stft_matrix
+
+
+def magphase(D):
+    """Separate a complex-valued spectrogram D into its magnitude (S)
+    and phase (P) components, so that `D = S * P`.
+
+
+    Parameters
+    ----------
+    D       : np.ndarray [shape=(d, t), dtype=complex]
+        complex-valued spectrogram
+
+
+    Returns
+    -------
+    D_mag   : np.ndarray [shape=(d, t), dtype=real]
+        magnitude of `D`
+    D_phase : np.ndarray [shape=(d, t), dtype=complex]
+        `exp(1.j * phi)` where `phi` is the phase of `D`
+
+
+    Examples
+    --------
+    >>> y, sr = librosa.load(librosa.util.example_audio_file())
+    >>> D = librosa.stft(y)
+    >>> magnitude, phase = librosa.magphase(D)
+    >>> magnitude
+    array([[  2.524e-03,   4.329e-02, ...,   3.217e-04,   3.520e-05],
+           [  2.645e-03,   5.152e-02, ...,   3.283e-04,   3.432e-04],
+           ...,
+           [  1.966e-05,   9.828e-06, ...,   3.164e-07,   9.370e-06],
+           [  1.966e-05,   9.830e-06, ...,   3.161e-07,   9.366e-06]], dtype=float32)
+    >>> phase
+    array([[  1.000e+00 +0.000e+00j,   1.000e+00 +0.000e+00j, ...,
+             -1.000e+00 +8.742e-08j,  -1.000e+00 +8.742e-08j],
+           [  1.000e+00 +1.615e-16j,   9.950e-01 -1.001e-01j, ...,
+              9.794e-01 +2.017e-01j,   1.492e-02 -9.999e-01j],
+           ...,
+           [  1.000e+00 -5.609e-15j,  -5.081e-04 +1.000e+00j, ...,
+             -9.549e-01 -2.970e-01j,   2.938e-01 -9.559e-01j],
+           [ -1.000e+00 +8.742e-08j,  -1.000e+00 +8.742e-08j, ...,
+             -1.000e+00 +8.742e-08j,  -1.000e+00 +8.742e-08j]], dtype=complex64)
+
+
+    Or get the phase angle (in radians)
+
+    >>> np.angle(phase)
+    array([[  0.000e+00,   0.000e+00, ...,   3.142e+00,   3.142e+00],
+           [  1.615e-16,  -1.003e-01, ...,   2.031e-01,  -1.556e+00],
+           ...,
+           [ -5.609e-15,   1.571e+00, ...,  -2.840e+00,  -1.273e+00],
+           [  3.142e+00,   3.142e+00, ...,   3.142e+00,   3.142e+00]], dtype=float32)
+
+    """
+
+    mag = np.abs(D)
+    phase = np.exp(1.j * np.angle(D))
+
+    return mag, phase
+
+
+def phase_vocoder(D, rate, hop_length=None):
+    """Phase vocoder.  Given an STFT matrix D, speed up by a factor of `rate`
+
+    Based on the implementation provided by [1]_.
+
+    .. [1] Ellis, D. P. W. "A phase vocoder in Matlab."
+        Columbia University, 2002.
+        http://www.ee.columbia.edu/~dpwe/resources/matlab/pvoc/
+
+    Examples
+    --------
+    >>> # Play at double speed
+    >>> y, sr   = librosa.load(librosa.util.example_audio_file())
+    >>> D       = librosa.stft(y, n_fft=2048, hop_length=512)
+    >>> D_fast  = librosa.phase_vocoder(D, 2.0, hop_length=512)
+    >>> y_fast  = librosa.istft(D_fast, hop_length=512)
+
+    >>> # Or play at 1/3 speed
+    >>> y, sr   = librosa.load(librosa.util.example_audio_file())
+    >>> D       = librosa.stft(y, n_fft=2048, hop_length=512)
+    >>> D_slow  = librosa.phase_vocoder(D, 1./3, hop_length=512)
+    >>> y_slow  = librosa.istft(D_slow, hop_length=512)
+
+    Parameters
+    ----------
+    D : np.ndarray [shape=(d, t), dtype=complex]
+        STFT matrix
+
+    rate :  float > 0 [scalar]
+        Speed-up factor: `rate > 1` is faster, `rate < 1` is slower.
+
+    hop_length : int > 0 [scalar] or None
+        The number of samples between successive columns of `D`.
+
+        If None, defaults to `n_fft/4 = (D.shape[0]-1)/2`
+
+    Returns
+    -------
+    D_stretched  : np.ndarray [shape=(d, t / rate), dtype=complex]
+        time-stretched STFT
+    """
+
+    n_fft = 2 * (D.shape[0] - 1)
+
+    if hop_length is None:
+        hop_length = int(n_fft // 4)
+
+    time_steps = np.arange(0, D.shape[1], rate, dtype=np.float)
+
+    # Create an empty output array
+    d_stretch = np.zeros((D.shape[0], len(time_steps)), D.dtype, order='F')
+
+    # Expected phase advance in each bin
+    phi_advance = np.linspace(0, np.pi * hop_length, D.shape[0])
+
+    # Phase accumulator; initialize to the first sample
+    phase_acc = np.angle(D[:, 0])
+
+    # Pad 0 columns to simplify boundary logic
+    D = np.pad(D, [(0, 0), (0, 2)], mode='constant')
+
+    for (t, step) in enumerate(time_steps):
+
+        columns = D[:, int(step):int(step + 2)]
+
+        # Weighting for linear magnitude interpolation
+        alpha = np.mod(step, 1.0)
+        mag = ((1.0 - alpha) * np.abs(columns[:, 0])
+               + alpha * np.abs(columns[:, 1]))
+
+        # Store to output array
+        d_stretch[:, t] = mag * np.exp(1.j * phase_acc)
+
+        # Compute phase advance
+        dphase = (np.angle(columns[:, 1])
+                  - np.angle(columns[:, 0])
+                  - phi_advance)
+
+        # Wrap to -pi:pi range
+        dphase = dphase - 2.0 * np.pi * np.round(dphase / (2.0 * np.pi))
+
+        # Accumulate phase
+        phase_acc += phi_advance + dphase
+
+    return d_stretch
+
+
+@cache(level=30)
+def power_to_db(S, ref=1.0, amin=1e-10, top_db=80.0, ref_power=Deprecated()):
+    """Convert a power spectrogram (amplitude squared) to decibel (dB) units
+
+    This computes the scaling ``10 * log10(S / ref)`` in a numerically
+    stable way.
+
+    Parameters
+    ----------
+    S : np.ndarray
+        input power
+
+    ref : scalar or callable
+        If scalar, the amplitude `abs(S)` is scaled relative to `ref`:
+        `10 * log10(S / ref)`.
+        Zeros in the output correspond to positions where `S == ref`.
+
+        If callable, the reference value is computed as `ref(S)`.
+
+    amin : float > 0 [scalar]
+        minimum threshold for `abs(S)` and `ref`
+
+    top_db : float >= 0 [scalar]
+        threshold the output at `top_db` below the peak:
+        ``max(10 * log10(S)) - top_db``
+
+    ref_power : scalar or callable
+        .. warning:: This parameter name was deprecated in librosa 0.5.0.
+            Use the `ref` parameter instead.
+            The `ref_power` parameter will be removed in librosa 0.6.0.
+
+    Returns
+    -------
+    S_db   : np.ndarray
+        ``S_db ~= 10 * log10(S) - 10 * log10(ref)``
+
+    See Also
+    --------
+    perceptual_weighting
+    db_to_power
+    amplitude_to_db
+    db_to_amplitude
+
+    Notes
+    -----
+    This function caches at level 30.
+
+
+    Examples
+    --------
+    Get a power spectrogram from a waveform ``y``
+
+    >>> y, sr = librosa.load(librosa.util.example_audio_file())
+    >>> S = np.abs(librosa.stft(y))
+    >>> librosa.power_to_db(S**2)
+    array([[-33.293, -27.32 , ..., -33.293, -33.293],
+           [-33.293, -25.723, ..., -33.293, -33.293],
+           ...,
+           [-33.293, -33.293, ..., -33.293, -33.293],
+           [-33.293, -33.293, ..., -33.293, -33.293]], dtype=float32)
+
+    Compute dB relative to peak power
+
+    >>> librosa.power_to_db(S**2, ref=np.max)
+    array([[-80.   , -74.027, ..., -80.   , -80.   ],
+           [-80.   , -72.431, ..., -80.   , -80.   ],
+           ...,
+           [-80.   , -80.   , ..., -80.   , -80.   ],
+           [-80.   , -80.   , ..., -80.   , -80.   ]], dtype=float32)
+
+
+    Or compare to median power
+
+    >>> librosa.power_to_db(S**2, ref=np.median)
+    array([[-0.189,  5.784, ..., -0.189, -0.189],
+           [-0.189,  7.381, ..., -0.189, -0.189],
+           ...,
+           [-0.189, -0.189, ..., -0.189, -0.189],
+           [-0.189, -0.189, ..., -0.189, -0.189]], dtype=float32)
+
+
+    And plot the results
+
+    >>> import matplotlib.pyplot as plt
+    >>> plt.figure()
+    >>> plt.subplot(2, 1, 1)
+    >>> librosa.display.specshow(S**2, sr=sr, y_axis='log')
+    >>> plt.colorbar()
+    >>> plt.title('Power spectrogram')
+    >>> plt.subplot(2, 1, 2)
+    >>> librosa.display.specshow(librosa.power_to_db(S**2, ref=np.max),
+    ...                          sr=sr, y_axis='log', x_axis='time')
+    >>> plt.colorbar(format='%+2.0f dB')
+    >>> plt.title('Log-Power spectrogram')
+    >>> plt.tight_layout()
+
+    """
+
+    if amin <= 0:
+        raise ParameterError('amin must be strictly positive')
+
+    magnitude = np.abs(S)
+
+    ref = rename_kw('ref_power', ref_power,
+                    'ref', ref,
+                    '0.5', '0.6')
+
+    if six.callable(ref):
+        # User supplied a function to calculate reference power
+        ref_value = ref(magnitude)
+    else:
+        ref_value = np.abs(ref)
+
+    log_spec = 10.0 * np.log10(np.maximum(amin, magnitude))
+    log_spec -= 10.0 * np.log10(np.maximum(amin, ref_value))
+
+    if top_db is not None:
+        if top_db < 0:
+            raise ParameterError('top_db must be non-negative')
+        log_spec = np.maximum(log_spec, log_spec.max() - top_db)
+
+    return log_spec
+
+
+logamplitude = moved('librosa.logamplitude', '0.5', '0.6')(power_to_db)
+
+
+@cache(level=30)
+def db_to_power(S_db, ref=1.0):
+    '''Convert a dB-scale spectrogram to a power spectrogram.
+
+    This effectively inverts `power_to_db`:
+
+        `db_to_power(S_db) ~= ref * 10.0**(S_db / 10)`
+
+    Parameters
+    ----------
+    S_db : np.ndarray
+        dB-scaled spectrogram
+
+    ref : number > 0
+        Reference power: output will be scaled by this value
+
+    Returns
+    -------
+    S : np.ndarray
+        Power spectrogram
+
+    Notes
+    -----
+    This function caches at level 30.
+    '''
+    return ref * np.power(10.0, 0.1 * S_db)
+
+
+@cache(level=30)
+def amplitude_to_db(S, ref=1.0, amin=1e-5, top_db=80.0):
+    '''Convert an amplitude spectrogram to dB-scaled spectrogram.
+
+    This is equivalent to ``power_to_db(S**2)``, but is provided for convenience.
+
+    Parameters
+    ----------
+    S : np.ndarray
+        input amplitude
+
+    ref : scalar or callable
+        If scalar, the amplitude `abs(S)` is scaled relative to `ref`:
+        `20 * log10(S / ref)`.
+        Zeros in the output correspond to positions where `S == ref`.
+
+        If callable, the reference value is computed as `ref(S)`.
+
+    amin : float > 0 [scalar]
+        minimum threshold for `S` and `ref`
+
+    top_db : float >= 0 [scalar]
+        threshold the output at `top_db` below the peak:
+        ``max(20 * log10(S)) - top_db``
+
+
+    Returns
+    -------
+    S_db : np.ndarray
+        ``S`` measured in dB
+
+    See Also
+    --------
+    logamplitude, power_to_db, db_to_amplitude
+
+    Notes
+    -----
+    This function caches at level 30.
+    '''
+    magnitude = np.abs(S)
+
+    if six.callable(ref):
+        # User supplied a function to calculate reference power
+        ref_value = ref(magnitude)
+    else:
+        ref_value = np.abs(ref)
+
+    magnitude **= 2
+    return power_to_db(magnitude, ref=ref_value**2, amin=amin**2,
+                       top_db=top_db)
+
+
+@cache(level=30)
+def db_to_amplitude(S_db, ref=1.0):
+    '''Convert a dB-scaled spectrogram to an amplitude spectrogram.
+
+    This effectively inverts `amplitude_to_db`:
+
+        `db_to_amplitude(S_db) ~= 10.0**(0.5 * (S_db + log10(ref)/10))`
+
+    Parameters
+    ----------
+    S_db : np.ndarray
+        dB-scaled spectrogram
+
+    ref: number > 0
+        Optional reference power.
+
+    Returns
+    -------
+    S : np.ndarray
+        Linear magnitude spectrogram
+
+    Notes
+    -----
+    This function caches at level 30.
+    '''
+    return db_to_power(S_db, ref=ref**2)**0.5
+
+
+@cache(level=30)
+def perceptual_weighting(S, frequencies, **kwargs):
+    '''Perceptual weighting of a power spectrogram:
+
+    `S_p[f] = A_weighting(f) + 10*log(S[f] / ref)`
+
+    Parameters
+    ----------
+    S : np.ndarray [shape=(d, t)]
+        Power spectrogram
+
+    frequencies : np.ndarray [shape=(d,)]
+        Center frequency for each row of `S`
+
+    kwargs : additional keyword arguments
+        Additional keyword arguments to `logamplitude`.
+
+    Returns
+    -------
+    S_p : np.ndarray [shape=(d, t)]
+        perceptually weighted version of `S`
+
+    See Also
+    --------
+    logamplitude
+
+    Notes
+    -----
+    This function caches at level 30.
+
+
+    Examples
+    --------
+    Re-weight a CQT power spectrum, using peak power as reference
+
+    >>> y, sr = librosa.load(librosa.util.example_audio_file())
+    >>> CQT = librosa.cqt(y, sr=sr, fmin=librosa.note_to_hz('A1'))
+    >>> freqs = librosa.cqt_frequencies(CQT.shape[0],
+    ...                                 fmin=librosa.note_to_hz('A1'))
+    >>> perceptual_CQT = librosa.perceptual_weighting(CQT**2,
+    ...                                               freqs,
+    ...                                               ref=np.max)
+    >>> perceptual_CQT
+    array([[ -80.076,  -80.049, ..., -104.735, -104.735],
+           [ -78.344,  -78.555, ..., -103.725, -103.725],
+           ...,
+           [ -76.272,  -76.272, ...,  -76.272,  -76.272],
+           [ -76.485,  -76.485, ...,  -76.485,  -76.485]])
+
+    >>> import matplotlib.pyplot as plt
+    >>> plt.figure()
+    >>> plt.subplot(2, 1, 1)
+    >>> librosa.display.specshow(librosa.amplitude_to_db(CQT,
+    ...                                                  ref=np.max),
+    ...                          fmin=librosa.note_to_hz('A1'),
+    ...                          y_axis='cqt_hz')
+    >>> plt.title('Log CQT power')
+    >>> plt.colorbar(format='%+2.0f dB')
+    >>> plt.subplot(2, 1, 2)
+    >>> librosa.display.specshow(perceptual_CQT, y_axis='cqt_hz',
+    ...                          fmin=librosa.note_to_hz('A1'),
+    ...                          x_axis='time')
+    >>> plt.title('Perceptually weighted log CQT')
+    >>> plt.colorbar(format='%+2.0f dB')
+    >>> plt.tight_layout()
+    '''
+
+    offset = time_frequency.A_weighting(frequencies).reshape((-1, 1))
+
+    return offset + logamplitude(S, **kwargs)
+
+
+@cache(level=30)
+def fmt(y, t_min=0.5, n_fmt=None, kind='cubic', beta=0.5, over_sample=1, axis=-1):
+    """The fast Mellin transform (FMT) [1]_ of a uniformly sampled signal y.
+
+    When the Mellin parameter (beta) is 1/2, it is also known as the scale transform [2]_.
+    The scale transform can be useful for audio analysis because its magnitude is invariant
+    to scaling of the domain (e.g., time stretching or compression).  This is analogous
+    to the magnitude of the Fourier transform being invariant to shifts in the input domain.
+
+
+    .. [1] De Sena, Antonio, and Davide Rocchesso.
+        "A fast Mellin and scale transform."
+        EURASIP Journal on Applied Signal Processing 2007.1 (2007): 75-75.
+
+    .. [2] Cohen, L.
+        "The scale representation."
+        IEEE Transactions on Signal Processing 41, no. 12 (1993): 3275-3292.
+
+    Parameters
+    ----------
+    y : np.ndarray, real-valued
+        The input signal(s).  Can be multidimensional.
+        The target axis must contain at least 3 samples.
+
+    t_min : float > 0
+        The minimum time spacing (in samples).
+        This value should generally be less than 1 to preserve as much information as
+        possible.
+
+    n_fmt : int > 2 or None
+        The number of scale transform bins to use.
+        If None, then `n_bins = over_sample * ceil(n * log((n-1)/t_min))` is taken,
+        where `n = y.shape[axis]`
+
+    kind : str
+        The type of interpolation to use when re-sampling the input.
+        See `scipy.interpolate.interp1d` for possible values.
+
+        Note that the default is to use high-precision (cubic) interpolation.
+        This can be slow in practice; if speed is preferred over accuracy,
+        then consider using `kind='linear'`.
+
+    beta : float
+        The Mellin parameter.  `beta=0.5` provides the scale transform.
+
+    over_sample : float >= 1
+        Over-sampling factor for exponential resampling.
+
+    axis : int
+        The axis along which to transform `y`
+
+    Returns
+    -------
+    x_scale : np.ndarray [dtype=complex]
+        The scale transform of `y` along the `axis` dimension.
+
+    Raises
+    ------
+    ParameterError
+        if `n_fmt < 2` or `t_min <= 0`
+        or if `y` is not finite
+        or if `y.shape[axis] < 3`.
+
+    Notes
+    -----
+    This function caches at level 30.
+
+
+    Examples
+    --------
+    >>> # Generate a signal and time-stretch it (with energy normalization)
+    >>> scale = 1.25
+    >>> freq = 3.0
+    >>> x1 = np.linspace(0, 1, num=1024, endpoint=False)
+    >>> x2 = np.linspace(0, 1, num=scale * len(x1), endpoint=False)
+    >>> y1 = np.sin(2 * np.pi * freq * x1)
+    >>> y2 = np.sin(2 * np.pi * freq * x2) / np.sqrt(scale)
+    >>> # Verify that the two signals have the same energy
+    >>> np.sum(np.abs(y1)**2), np.sum(np.abs(y2)**2)
+        (255.99999999999997, 255.99999999999969)
+    >>> scale1 = librosa.fmt(y1, n_fmt=512)
+    >>> scale2 = librosa.fmt(y2, n_fmt=512)
+    >>> # And plot the results
+    >>> import matplotlib.pyplot as plt
+    >>> plt.figure(figsize=(8, 4))
+    >>> plt.subplot(1, 2, 1)
+    >>> plt.plot(y1, label='Original')
+    >>> plt.plot(y2, linestyle='--', label='Stretched')
+    >>> plt.xlabel('time (samples)')
+    >>> plt.title('Input signals')
+    >>> plt.legend(frameon=True)
+    >>> plt.axis('tight')
+    >>> plt.subplot(1, 2, 2)
+    >>> plt.semilogy(np.abs(scale1), label='Original')
+    >>> plt.semilogy(np.abs(scale2), linestyle='--', label='Stretched')
+    >>> plt.xlabel('scale coefficients')
+    >>> plt.title('Scale transform magnitude')
+    >>> plt.legend(frameon=True)
+    >>> plt.axis('tight')
+    >>> plt.tight_layout()
+
+    >>> # Plot the scale transform of an onset strength autocorrelation
+    >>> y, sr = librosa.load(librosa.util.example_audio_file(),
+    ...                      offset=10.0, duration=30.0)
+    >>> odf = librosa.onset.onset_strength(y=y, sr=sr)
+    >>> # Auto-correlate with up to 10 seconds lag
+    >>> odf_ac = librosa.autocorrelate(odf, max_size=10 * sr // 512)
+    >>> # Normalize
+    >>> odf_ac = librosa.util.normalize(odf_ac, norm=np.inf)
+    >>> # Compute the scale transform
+    >>> odf_ac_scale = librosa.fmt(librosa.util.normalize(odf_ac), n_fmt=512)
+    >>> # Plot the results
+    >>> plt.figure()
+    >>> plt.subplot(3, 1, 1)
+    >>> plt.plot(odf, label='Onset strength')
+    >>> plt.axis('tight')
+    >>> plt.xlabel('Time (frames)')
+    >>> plt.xticks([])
+    >>> plt.legend(frameon=True)
+    >>> plt.subplot(3, 1, 2)
+    >>> plt.plot(odf_ac, label='Onset autocorrelation')
+    >>> plt.axis('tight')
+    >>> plt.xlabel('Lag (frames)')
+    >>> plt.xticks([])
+    >>> plt.legend(frameon=True)
+    >>> plt.subplot(3, 1, 3)
+    >>> plt.semilogy(np.abs(odf_ac_scale), label='Scale transform magnitude')
+    >>> plt.axis('tight')
+    >>> plt.xlabel('scale coefficients')
+    >>> plt.legend(frameon=True)
+    >>> plt.tight_layout()
+    """
+
+    n = y.shape[axis]
+
+    if n < 3:
+        raise ParameterError('y.shape[{:}]=={:} < 3'.format(axis, n))
+
+    if t_min <= 0:
+        raise ParameterError('t_min must be a positive number')
+
+    if n_fmt is None:
+        if over_sample < 1:
+            raise ParameterError('over_sample must be >= 1')
+
+        # The base is the maximum ratio between adjacent samples
+        # Since the sample spacing is increasing, this is simply the
+        # ratio between the positions of the last two samples: (n-1)/(n-2)
+        log_base = np.log(n - 1) - np.log(n - 2)
+
+        n_fmt = int(np.ceil(over_sample * (np.log(n - 1) - np.log(t_min)) / log_base))
+
+    elif n_fmt < 3:
+        raise ParameterError('n_fmt=={:} < 3'.format(n_fmt))
+    else:
+        log_base = (np.log(n_fmt - 1) - np.log(n_fmt - 2)) / over_sample
+
+    if not np.all(np.isfinite(y)):
+        raise ParameterError('y must be finite everywhere')
+
+    base = np.exp(log_base)
+    # original grid: signal covers [0, 1).  This range is arbitrary, but convenient.
+    # The final sample is positioned at (n-1)/n, so we omit the endpoint
+    x = np.linspace(0, 1, num=n, endpoint=False)
+
+    # build the interpolator
+    f_interp = scipy.interpolate.interp1d(x, y, kind=kind, axis=axis)
+
+    # build the new sampling grid
+    # exponentially spaced between t_min/n and 1 (exclusive)
+    # we'll go one past where we need, and drop the last sample
+    # When over-sampling, the last input sample contributions n_over samples.
+    # To keep the spacing consistent, we over-sample by n_over, and then
+    # trim the final samples.
+    n_over = int(np.ceil(over_sample))
+    x_exp = np.logspace((np.log(t_min) - np.log(n)) / log_base,
+                        0,
+                        num=n_fmt + n_over,
+                        endpoint=False,
+                        base=base)[:-n_over]
+
+    # Clean up any rounding errors at the boundaries of the interpolation
+    # The interpolator gets angry if we try to extrapolate, so clipping is necessary here.
+    if x_exp[0] < t_min or x_exp[-1] > float(n - 1.0) / n:
+        x_exp = np.clip(x_exp, float(t_min) / n, x[-1])
+
+    # Make sure that all sample points are unique
+    assert len(np.unique(x_exp)) == len(x_exp)
+
+    # Resample the signal
+    y_res = f_interp(x_exp)
+
+    # Broadcast the window correctly
+    shape = [1] * y_res.ndim
+    shape[axis] = -1
+
+    # Apply the window and fft
+    result = fft.fft(y_res * (x_exp**beta).reshape(shape),
+                     axis=axis, overwrite_x=True)
+
+    # Slice out the positive-scale component
+    idx = [slice(None)] * result.ndim
+    idx[axis] = slice(0, 1 + n_fmt//2)
+
+    # Truncate and length-normalize
+    return result[idx] * np.sqrt(n) / n_fmt
+
+
+def _spectrogram(y=None, S=None, n_fft=2048, hop_length=512, power=1):
+    '''Helper function to retrieve a magnitude spectrogram.
+
+    This is primarily used in feature extraction functions that can operate on
+    either audio time-series or spectrogram input.
+
+
+    Parameters
+    ----------
+    y : None or np.ndarray [ndim=1]
+        If provided, an audio time series
+
+    S : None or np.ndarray
+        Spectrogram input, optional
+
+    n_fft : int > 0
+        STFT window size
+
+    hop_length : int > 0
+        STFT hop length
+
+    power : float > 0
+        Exponent for the magnitude spectrogram,
+        e.g., 1 for energy, 2 for power, etc.
+
+    Returns
+    -------
+    S_out : np.ndarray [dtype=np.float32]
+        - If `S` is provided as input, then `S_out == S`
+        - Else, `S_out = |stft(y, n_fft=n_fft, hop_length=hop_length)|**power`
+
+    n_fft : int > 0
+        - If `S` is provided, then `n_fft` is inferred from `S`
+        - Else, copied from input
+    '''
+
+    if S is not None:
+        # Infer n_fft from spectrogram shape
+        n_fft = 2 * (S.shape[0] - 1)
+    else:
+        # Otherwise, compute a magnitude spectrogram from input
+        S = np.abs(stft(y, n_fft=n_fft, hop_length=hop_length))**power
+
+    return S, n_fft
