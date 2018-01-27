@@ -4,6 +4,14 @@ These shell scripts generate the WSJ0 and THCHS-30 datasets used in
          "Modeling attention and memory for auditory selection in a cocktail party environment"    
          AAAI, 2018.    
           
+WSJ0: https://catalog.ldc.upenn.edu/LDC93S6A    
+
+    Garofalo, J.; Graff, D.; Paul, D.; and Pallett, D. 2007. Csr-i (wsj0) complete. Linguistic Data Consortium, Philadelphia.    
+
+THCHS-30: https://github.com/kaldi-asr/kaldi/tree/master/egs/thchs30    
+ 
+    Wang, D., and Zhang, X. 2015. Thchs-30: A free chinese speech corpus. arXiv preprint arXiv:1512.01882.    
+
 WSJ0 should be converted into wav files by sph2pipe tool as follows:    
 
     sph2pipe -f wav filename.wv1 filename.wav    
