@@ -27,6 +27,7 @@ Figure 2: An illustration of our Auditory Selection with Attention and Memory (A
 
 Figure 3: Effects of attention with different amounts of stimulus on one male and female mixture sample from WSJ0. (a) shows the SIR (Signal-to-Interference Ratio), SAR (Signal-to-Artifacts Ratio) and NSDR results, (b)-(d) are the auditory stimuli whose magnitudes are divided by the maximum magnitude, (e) is the mixture input spectrogram, (i) is the target spectrogram, (f)-(h) are attention maps based on the corresponding auditory stimuli and (j)-(l) are the corresponding predictions with their NSDR performances.                
 
+
 ![](https://camo.githubusercontent.com/0e32abe541a386cbaf8370777b4b55c35d31657d/68747470733a2f2f692e6372656174697665636f6d6d6f6e732e6f72672f6c2f62792d6e632f342e302f38387833312e706e67)    
 
 This work is licensed under a [Creative Commons Attribution-NonCommercial 4.0 International License](http://creativecommons.org/licenses/by-nc/4.0/).    
