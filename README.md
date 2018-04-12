@@ -2,7 +2,7 @@
 
 =======================================================================    
 
-Our demo code is implemented in Keras (writtern in Python).    
+Our demo code is implemented in Keras (writtern in Python, and the backend is theano).    
 
 Usage:    
 $python main_run.py    
